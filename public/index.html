@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qeep · mobile social</title>
+<meta name="description" content="A loving revival of qeep - the classic J2ME mobile social network. Chat, play, collect coins.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="room">
+    <div class="phone" id="phone">
+      <div class="topline">
+        <div class="earpiece"></div>
+        <div class="cam"></div>
+      </div>
+
+      <div class="bezel">
+        <div class="screen" id="screen">
+          <div class="statusbar">
+            <span class="sig" id="sig">▮▮▮▯</span>
+            <span class="sbrand">qeep</span>
+            <span class="bat"><span>▮▮▮</span>⛁</span>
+          </div>
+          <div class="viewport" id="app" tabindex="0"></div>
+          <div class="softkeys" id="softkeys">
+            <button class="soft left" id="softLeft" data-key="left">Select</button>
+            <button class="soft right" id="softRight" data-key="right">Back</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="pad-area">
+        <div class="keys-top">
+          <button class="softbtn" id="hwLeft" data-key="left"><span class="tick">≡</span></button>
+          <div class="navcluster">
+            <button class="nav" data-key="up" aria-label="up">▲</button>
+            <div class="navrow">
+              <button class="nav" data-key="left" aria-label="left">◀</button>
+              <button class="nav ok" data-key="ok" aria-label="ok">OK</button>
+              <button class="nav" data-key="right" aria-label="right">▶</button>
+            </div>
+            <button class="nav" data-key="down" aria-label="down">▼</button>
+          </div>
+          <button class="softbtn" id="hwRight" data-key="right"><span class="tick">⌂</span></button>
+        </div>
+        <div class="keypad">
+          <button class="key" data-key="1">1<small>&nbsp;</small></button>
+          <button class="key" data-key="2">2<small>ABC</small></button>
+          <button class="key" data-key="3">3<small>DEF</small></button>
+          <button class="key" data-key="4">4<small>GHI</small></button>
+          <button class="key" data-key="5">5<small>JKL</small></button>
+          <button class="key" data-key="6">6<small>MNO</small></button>
+          <button class="key" data-key="7">7<small>PQRS</small></button>
+          <button class="key" data-key="8">8<small>TUV</small></button>
+          <button class="key" data-key="9">9<small>WXYZ</small></button>
+          <button class="key" data-key="*">*<small>+</small></button>
+          <button class="key" data-key="0">0<small>&nbsp;</small></button>
+          <button class="key" data-key="#">#<small>⇧</small></button>
+        </div>
+      </div>
+
+      <div class="brandline">qeep<span class="dot">·</span>revival</div>
+    </div>
+
+    <div class="note">
+      <p><b>Tip:</b> use the <b>arrow keys</b> + <b>Enter</b>, click the phone, or press the on-screen buttons.</p>
+      <p class="muted">Best with sound on. Click the <b>qeep</b> logo in the status bar to toggle sound.</p>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

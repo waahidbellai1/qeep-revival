@@ -1,0 +1,14 @@
+# Render blueprint - free tier, no credit card needed.
+# Deploy from the repo root: Render reads this automatically.
+services:
+  - type: web
+    name: qeep-revival
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
