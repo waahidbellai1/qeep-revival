@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax check
+        run: |
+          node --check server.js
+          node --check lib/content.js
+          node --check lib/store.js
+          node --check lib/world.js
+          node --check lib/games.js
+          node --check public/app.js
+          node --check scripts/smoke.js
+
+      - name: Boot the server and check the API
+        run: node scripts/smoke.js

@@ -1,380 +1,179 @@
-/*
- * qeep revival - tiny multiplayer server
- * Zero dependencies. Just run:  node server.js
- *
- * Serves the retro phone UI from /public and provides:
- *   - nickname login + profiles + coins
- *   - realtime global chat (Server-Sent Events)
- *   - turn-based multiplayer games (Tic-Tac-Toe, Connect Four)
- *   - a friendly bot opponent if nobody else is around
- */
+/* ============================================================
+   qeep revival v2 - server
+   Zero required dependencies. Run:  node server.js
+   Optional: set DATABASE_URL to persist to Postgres instead of a file.
+   ============================================================ */
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+
+const store = require('./lib/store');
+const world = require('./lib/world');
+const games = require('./lib/games');
+const C = require('./lib/content');
 
 const PORT = process.env.PORT || 8080;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-/* ------------------------------------------------------------------ *
- *  In-memory world state (resets when the server restarts)
- * ------------------------------------------------------------------ */
+/* ------------------------------- realtime ------------------------------- */
 
-const players = new Map();      // token -> player object
-const streams = new Map();      // token -> Set<res>  (open SSE connections)
-const matches = new Map();      // matchId -> match object
-const queues = { tictactoe: [], connect4: [] };
-const botTimers = new Map();    // matchId -> timeout handle
-
-const ROOM_NAMES = { lobby: 'The Lobby', sayhi: 'Say Hi', gamers: 'Game Central' };
-const rooms = {};
-for (const id of Object.keys(ROOM_NAMES)) {
-  rooms[id] = { id, name: ROOM_NAMES[id], messages: [] };
-}
-const CHAT_LIMIT = 60;
-
-const BOT_NAMES = ['QeepBot', 'NokiaFan', 'S60Legend', 'SnakeKing', 'GprsGuru', 'BsnlBoi'];
-
-function uid() { return crypto.randomBytes(9).toString('hex'); }
-function now() { return Date.now(); }
-
-function makePlayer(nick) {
-  const p = {
-    token: uid(),
-    nick: String(nick || 'guest').slice(0, 14).replace(/[^\w \-]/g, '') || 'guest',
-    coins: 100,
-    wins: 0,
-    losses: 0,
-    draws: 0,
-    avatar: 1 + Math.floor(Math.random() * 8),
-    created: now(),
-    lastSeen: now(),
-  };
-  players.set(p.token, p);
-  return p;
-}
-
-function publicProfile(p) {
-  if (!p) return null;
-  return {
-    token: p.token, nick: p.nick, coins: p.coins,
-    wins: p.wins, losses: p.losses, draws: p.draws, avatar: p.avatar,
-  };
-}
-
-function send(res, code, type, body) {
-  const payload = Buffer.isBuffer(body) ? body
-    : (typeof body === 'string' ? body : JSON.stringify(body ?? {}));
-  res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' });
-  res.end(payload);
-}
-
-function json(res, code, body) { send(res, code, 'application/json', body); }
-
-/* ------------------------------------------------------------------ *
- *  Realtime push (SSE)
- * ------------------------------------------------------------------ */
+const streams = new Map();     // token -> Set<res>
+const botTimers = new Map();   // "matchId:seat" -> timeout
 
 function push(token, event) {
   const set = streams.get(token);
   if (!set) return;
   const data = `data: ${JSON.stringify(event)}\n\n`;
-  for (const res of set) {
-    try { res.write(data); } catch (_) { /* dropped connection */ }
+  for (const res of set) { try { res.write(data); } catch (_) {} }
+}
+world.setPush(push);
+
+function onlineCount() { let n = 0; for (const [, s] of streams) if (s.size) n++; return n; }
+
+/* ------------------------------- matches ------------------------------- */
+
+const queues = {};
+const matches = new Map();     // matchId -> match
+const matchById = (id) => matches.get(id) || null;
+
+function persist() { store.scheduleSave(() => world.snapshot()); }
+
+function newSeat(p) { return { token: p.token, nick: p.nick, avatar: p.avatar, mark: null, bot: false }; }
+function botSeat() {
+  const names = ['QeepBot', 'NokiaFan', 'S60Legend', 'SnakeKing', 'GprsGuru', 'BsnlBoi', 'WapWizard', 'EdgeEnjoyer'];
+  return { token: 'bot_' + Math.random().toString(36).slice(2), nick: names[Math.floor(Math.random() * names.length)], avatar: 1 + Math.floor(Math.random() * 8), mark: null, bot: true };
+}
+
+function pushMatch(m) {
+  const view = games.matchView(m);
+  for (const seat of m.seats) if (!seat.bot) push(seat.token, { type: 'matchUpdate', match: view });
+}
+
+function afterChange(m, wasPlaying) {
+  if (wasPlaying && m.status === 'finished') world.rewardGame(m);
+  pushMatch(m);
+  scheduleBots(m);
+  persist();
+}
+
+function scheduleBots(m) {
+  if (m.status !== 'playing') return;
+  for (const si of games.botSeats(m)) {
+    const key = m.id + ':' + si;
+    if (botTimers.has(key)) continue;
+    botTimers.set(key, setTimeout(() => {
+      botTimers.delete(key);
+      if (m.status !== 'playing') return;
+      const wasPlaying = m.status === 'playing';
+      const mv = games.botMove(m, si);
+      let r = games.applyMove(m, si, mv);
+      if (r.error) {
+        // safety net: never leave a game stuck
+        const fb = games.fallbackMove(m, si);
+        if (fb != null) r = games.applyMove(m, si, fb);
+        if (r.error) console.warn('[bot] unrecoverable move', m.game, r.error);
+      }
+      afterChange(m, wasPlaying);
+    }, 700 + Math.random() * 900));
   }
-}
-
-function broadcastRoom(roomId, event) {
-  for (const [token] of streams) push(token, event);
-  void roomId;
-}
-
-function onlineCount() {
-  let n = 0;
-  for (const [, set] of streams) if (set.size) n++;
-  return n;
-}
-
-/* ------------------------------------------------------------------ *
- *  Chat
- * ------------------------------------------------------------------ */
-
-function postChat(roomId, player, text, system) {
-  const room = rooms[roomId] || rooms.lobby;
-  const msg = {
-    id: uid(),
-    room: room.id,
-    from: system ? null : player.token,
-    nick: system ? 'system' : player.nick,
-    avatar: system ? 0 : player.avatar,
-    text: String(text).slice(0, 160),
-    system: !!system,
-    at: now(),
-  };
-  room.messages.push(msg);
-  if (room.messages.length > CHAT_LIMIT) room.messages.shift();
-  broadcastRoom(room.id, { type: 'chat', room: room.id, msg });
-  return msg;
-}
-
-/* ------------------------------------------------------------------ *
- *  Games
- * ------------------------------------------------------------------ */
-
-function makeTicTacToe(a, b) {
-  return {
-    id: uid(), game: 'tictactoe', status: 'playing',
-    board: Array(9).fill(null),
-    seats: [a, b], turn: 0, winner: null, line: null,
-    createdAt: now(),
-  };
-}
-
-function makeConnect4(a, b) {
-  // board stored as 7 columns of 6 cells (bottom-up)
-  return {
-    id: uid(), game: 'connect4', status: 'playing',
-    board: Array.from({ length: 7 }, () => []),
-    seats: [a, b], turn: 0, winner: null, line: null,
-    createdAt: now(),
-  };
-}
-
-function seatView(seat) {
-  return {
-    token: seat.token, nick: seat.nick, avatar: seat.avatar,
-    bot: !!seat.bot, mark: seat.mark,
-  };
-}
-
-function matchView(m) {
-  return {
-    id: m.id, game: m.game, status: m.status, board: m.board,
-    turn: m.turn, winner: m.winner, line: m.line,
-    seats: m.seats.map(seatView),
-  };
-}
-
-function pushMatch(m, extra = {}) {
-  for (const seat of m.seats) {
-    if (seat.bot) continue;
-    push(seat.token, { type: 'matchUpdate', match: matchView(m), ...extra });
-  }
-}
-
-function newSeat(token, nick, avatar, mark, bot) {
-  return { token, nick, avatar, mark, bot: !!bot };
-}
-
-function botSeat(mark) {
-  const name = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
-  return newSeat('bot_' + uid(), name, 1 + Math.floor(Math.random() * 8), mark, true);
 }
 
 function startMatch(game, a, b) {
-  let m;
-  if (game === 'tictactoe') { a.mark = 'X'; b.mark = 'O'; m = makeTicTacToe(a, b); }
-  else { a.mark = 'R'; b.mark = 'Y'; m = makeConnect4(a, b); }
+  const m = games.createMatch(game, a, b);
   matches.set(m.id, m);
-  pushMatch(m, { matched: true });
-  scheduleBotIfNeeded(m);
+  for (const seat of m.seats) if (!seat.bot) push(seat.token, { type: 'matchUpdate', match: games.matchView(m), matched: true });
+  scheduleBots(m);
+  persist();
   return m;
 }
 
-function enqueue(game, player) {
-  const q = queues[game];
-  const opponent = q.find((t) => t !== player.token && players.has(t));
-  if (opponent) {
-    queues[game] = q.filter((t) => t !== player.token && t !== opponent);
-    cancelQueue(game, player.token);
-    cancelQueue(game, opponent);
-    const b = players.get(opponent);
-    const first = Math.random() < 0.5 ? player : b;   // randomize who goes first
-    const second = first === player ? b : player;
-    return startMatch(game, newSeat(first.token, first.nick, first.avatar), newSeat(second.token, second.nick, second.avatar));
-  }
+function cancelQueue(game, token) {
+  const q = queues[game] || (queues[game] = []);
+  for (let i = q.length - 1; i >= 0; i--) if (q[i] === token) q.splice(i, 1);
+  const p = world.get(token);
+  if (p && p.botTimers && p.botTimers[game]) { clearTimeout(p.botTimers[game]); delete p.botTimers[game]; }
+}
 
-  // nobody around yet -> wait, then pit the player against a friendly bot
+function enqueue(game, player) {
+  const q = queues[game] || (queues[game] = []);
+  const oppTok = q.find((t) => t !== player.token && world.get(t));
+  if (oppTok) {
+    cancelQueue(game, player.token); cancelQueue(game, oppTok);
+    const b = world.get(oppTok);
+    const first = Math.random() < 0.5 ? player : b;
+    const second = first === player ? b : player;
+    return startMatch(game, newSeat(first), newSeat(second));
+  }
   cancelQueue(game, player.token);
-  if (!q.includes(player.token)) q.push(player.token);
+  q.push(player.token);
   if (!player.botTimers) player.botTimers = {};
   player.botTimers[game] = setTimeout(() => {
-    const idx = queues[game].indexOf(player.token);
-    if (idx === -1) return; // already matched with a human
-    queues[game].splice(idx, 1);
-    const p = players.get(player.token);
+    const idx = q.indexOf(player.token);
+    if (idx === -1) return;
+    q.splice(idx, 1);
+    const p = world.get(player.token);
     if (!p) return;
-    const human = newSeat(p.token, p.nick, p.avatar);
-    const bot = botSeat('X');
+    const human = newSeat(p), bot = botSeat();
     const botFirst = Math.random() < 0.5;
     startMatch(game, botFirst ? bot : human, botFirst ? human : bot);
   }, 9000);
   return null;
 }
 
-function cancelQueue(game, token) {
-  const q = queues[game];
-  for (let i = q.length - 1; i >= 0; i--) if (q[i] === token) q.splice(i, 1);
-  const p = players.get(token);
-  if (p && p.botTimers && p.botTimers[game]) { clearTimeout(p.botTimers[game]); delete p.botTimers[game]; }
+/* ------------------------------- chat helpers ------------------------------- */
+
+const chatTimes = new Map(); // token -> [timestamps]
+function rateLimited(token) {
+  const t = Date.now();
+  const arr = (chatTimes.get(token) || []).filter((x) => t - x < 6000);
+  if (arr.length >= 8) { chatTimes.set(token, arr); return true; }
+  arr.push(t); chatTimes.set(token, arr); return false;
 }
 
-/* -- win detection ------------------------------------------------- */
+function decorate(text) {
+  let out = String(text);
+  for (const [k, v] of Object.entries(C.EMOTICONS)) out = out.split(k).join(v);
+  return out;
+}
 
-const TT_LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
-function ttWinner(b) {
-  for (const [x, y, z] of TT_LINES) {
-    if (b[x] && b[x] === b[y] && b[y] === b[z]) return { mark: b[x], line: [x, y, z] };
+function handleCommand(player, roomId, text) {
+  const [cmd, ...rest] = text.slice(1).split(' ');
+  const arg = rest.join(' ');
+  if (cmd === 'me' && arg) { world.postChat(roomId, player, `* ${player.nick} ${arg} *`, false); return true; }
+  if (cmd === 'roll') { const n = 1 + Math.floor(Math.random() * 100); world.postChat(roomId, player, `* ${player.nick} rolls a ${n} (1-100) *`, false); return true; }
+  if (cmd === 'help') {
+    push(player.token, { type: 'info', title: 'Commands', lines: ['/me <action> - emote', '/roll - roll a dice', '/help - this list'] });
+    return true;
   }
-  return b.every(Boolean) ? { mark: 'draw', line: null } : null;
+  return false;
 }
 
-function c4Winner(cols) {
-  const grid = Array.from({ length: 6 }, () => Array(7).fill(null));
-  cols.forEach((col, c) => col.forEach((cell, r) => { grid[r][c] = cell; }));
-  const dirs = [[1,0],[0,1],[1,1],[1,-1]];
-  for (let r = 0; r < 6; r++) for (let c = 0; c < 7; c++) {
-    const v = grid[r][c];
-    if (!v) continue;
-    for (const [dc, dr] of dirs) {
-      const cells = [[r, c]];
-      for (let k = 1; k < 4; k++) {
-        const rr = r + dr * k, cc = c + dc * k;
-        if (rr < 0 || rr > 5 || cc < 0 || cc > 6 || grid[rr][cc] !== v) { cells.length = 0; break; }
-        cells.push([rr, cc]);
-      }
-      if (cells.length === 4) return { mark: v, line: cells };
-    }
-  }
-  return cols.every((col) => col.length === 6) ? { mark: 'draw', line: null } : null;
+/* ------------------------------- http helpers ------------------------------- */
+
+function send(res, code, type, body) {
+  const payload = Buffer.isBuffer(body) ? body : (typeof body === 'string' ? body : JSON.stringify(body ?? {}));
+  res.writeHead(code, { 'Content-Type': type, 'Cache-Control': 'no-store' });
+  res.end(payload);
 }
-
-/* -- move application ---------------------------------------------- */
-
-function applyMove(m, seatIndex, move) {
-  if (m.status !== 'playing') return { error: 'Game is over' };
-  if (m.turn !== seatIndex) return { error: 'Not your turn' };
-  const mark = m.seats[seatIndex].mark;
-
-  if (m.game === 'tictactoe') {
-    const i = Number(move);
-    if (!Number.isInteger(i) || i < 0 || i > 8) return { error: 'Bad square' };
-    if (m.board[i]) return { error: 'Square taken' };
-    m.board[i] = mark;
-    const w = ttWinner(m.board);
-    if (w) finish(m, w.mark === 'draw' ? null : w.mark, w.line);
-  } else {
-    const c = Number(move);
-    if (!Number.isInteger(c) || c < 0 || c > 6) return { error: 'Bad column' };
-    if (m.board[c].length >= 6) return { error: 'Column full' };
-    m.board[c].push(mark);
-    const w = c4Winner(m.board);
-    if (w) finish(m, w.mark === 'draw' ? null : w.mark, w.line);
-  }
-
-  if (m.status === 'playing') m.turn = 1 - m.turn;
-  return { ok: true };
-}
-
-function finish(m, winMark, line) {
-  m.status = 'finished';
-  m.winner = winMark;
-  m.line = line;
-  const botTimer = botTimers.get(m.id);
-  if (botTimer) { clearTimeout(botTimer); botTimers.delete(m.id); }
-
-  m.seats.forEach((seat, i) => {
-    if (seat.bot) return;
-    const p = players.get(seat.token);
-    if (!p) return;
-    if (winMark === null) { p.draws++; p.coins += 5; }
-    else if (seat.mark === winMark) { p.wins++; p.coins += 25; }
-    else { p.losses++; p.coins += 5; }
-    push(seat.token, { type: 'profile', profile: publicProfile(p) });
-  });
-}
-
-/* -- bot brain ----------------------------------------------------- */
-
-function botChooseMove(m) {
-  if (m.game === 'tictactoe') {
-    const empty = m.board.map((v, i) => (v ? null : i)).filter((v) => v !== null);
-    const mark = m.seats[m.turn].mark;
-    const foe = mark === 'X' ? 'O' : 'X';
-    const wouldWin = (idx, who) => {
-      const copy = m.board.slice(); copy[idx] = who;
-      return ttWinner(copy) && ttWinner(copy).mark === who;
-    };
-    for (const i of empty) if (wouldWin(i, mark)) return i;
-    for (const i of empty) if (wouldWin(i, foe)) return i;
-    if (empty.includes(4)) return 4;
-    const corners = [0, 2, 6, 8].filter((i) => empty.includes(i));
-    if (corners.length && Math.random() < 0.8) return corners[Math.floor(Math.random() * corners.length)];
-    return empty[Math.floor(Math.random() * empty.length)];
-  }
-  // connect four: win, block, else prefer center
-  const legal = [];
-  for (let c = 0; c < 7; c++) if (m.board[c].length < 6) legal.push(c);
-  const mark = m.seats[m.turn].mark;
-  const foe = mark === 'R' ? 'Y' : 'R';
-  const tryDrop = (c, who) => {
-    const copy = m.board.map((col) => col.slice());
-    copy[c].push(who);
-    const w = c4Winner(copy);
-    return w && w.mark === who;
-  };
-  for (const c of legal) if (tryDrop(c, mark)) return c;
-  for (const c of legal) if (tryDrop(c, foe)) return c;
-  const order = [3, 2, 4, 1, 5, 0, 6].filter((c) => legal.includes(c));
-  return order[0];
-}
-
-function scheduleBotIfNeeded(m) {
-  if (m.status !== 'playing') return;
-  const seat = m.seats[m.turn];
-  if (!seat || !seat.bot) return;
-  const delay = 700 + Math.random() * 900;
-  const t = setTimeout(() => {
-    botTimers.delete(m.id);
-    if (m.status !== 'playing') return;
-    const mv = botChooseMove(m);
-    applyMove(m, m.turn, mv);
-    pushMatch(m);
-    scheduleBotIfNeeded(m);
-  }, delay);
-  botTimers.set(m.id, t);
-}
-
-/* ------------------------------------------------------------------ *
- *  HTTP handling
- * ------------------------------------------------------------------ */
+const json = (res, code, body) => send(res, code, 'application/json; charset=utf-8', body);
 
 function readBody(req) {
   return new Promise((resolve) => {
     let data = '';
-    req.on('data', (c) => { data += c; if (data.length > 1e6) req.destroy(); });
-    req.on('end', () => {
-      try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); }
-    });
+    req.on('data', (c) => { data += c; if (data.length > 2e6) req.destroy(); });
+    req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch { resolve({}); } });
   });
 }
 
 function auth(req, body) {
   const token = body.token || new URL(req.url, 'http://x').searchParams.get('token');
-  const p = players.get(token);
-  if (p) p.lastSeen = now();
+  const p = world.get(token);
+  if (p) world.touch(p);
   return p;
 }
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
-};
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff2': 'font/woff2' };
 
 function serveStatic(req, res, urlPath) {
   let rel = decodeURIComponent(urlPath.split('?')[0]);
@@ -387,127 +186,254 @@ function serveStatic(req, res, urlPath) {
   });
 }
 
+/* ------------------------------- routes ------------------------------- */
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
+  const POST = req.method === 'POST';
 
   try {
-    if (req.method === 'GET' && p === '/health') {
-      return json(res, 200, { ok: true, online: onlineCount(), matches: matches.size, uptime: Math.round(process.uptime()) });
+    /* ---------- public data ---------- */
+    if (req.method === 'GET' && p === '/health') return json(res, 200, { ok: true, online: onlineCount(), uptime: Math.round(process.uptime()) });
+    if (req.method === 'GET' && p === '/api/stats') return json(res, 200, { ...world.stats(), online: onlineCount(), store: store.info().mode });
+    if (req.method === 'GET' && p === '/api/games') return json(res, 200, { games: games.meta() });
+    if (req.method === 'GET' && p === '/api/content') {
+      return json(res, 200, { avatars: C.AVATARS, titles: C.TITLES, badges: C.BADGES, shop: C.SHOP, rooms: Object.values(world.rooms).map((r) => ({ id: r.id, name: r.name, topic: r.topic })) });
     }
-
+    if (req.method === 'GET' && p === '/api/shop') return json(res, 200, { shop: C.SHOP });
+    if (req.method === 'GET' && p === '/api/leaderboard') return json(res, 200, { board: url.searchParams.get('board') || 'wins', top: world.leaderboard(url.searchParams.get('board') || 'wins'), online: onlineCount() });
     if (req.method === 'GET' && p === '/api/rooms') {
-      return json(res, 200, {
-        rooms: Object.values(rooms).map((r) => ({ id: r.id, name: r.name, last: r.messages.at(-1) || null })),
-        online: onlineCount(),
-      });
+      return json(res, 200, { rooms: Object.values(world.rooms).map((r) => ({ id: r.id, name: r.name, topic: r.topic, last: r.messages.at(-1) || null })), online: onlineCount() });
     }
 
-    if (req.method === 'GET' && p === '/api/leaderboard') {
-      const top = [...players.values()].sort((a, b) => b.wins - a.wins || b.coins - a.coins).slice(0, 10);
-      return json(res, 200, { top: top.map(publicProfile), online: onlineCount() });
-    }
-
+    /* ---------- realtime ---------- */
     if (req.method === 'GET' && p === '/events') {
       const token = url.searchParams.get('token');
-      if (!players.has(token)) return send(res, 401, 'text/plain', 'unknown player');
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      });
-      res.write(`retry: 2000\n\n`);
+      const player = world.get(token);
+      if (!player) return send(res, 401, 'text/plain', 'unknown player');
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      res.write('retry: 2000\n\n');
       if (!streams.has(token)) streams.set(token, new Set());
       streams.get(token).add(res);
-      push(token, { type: 'hello', online: onlineCount() });
-
+      const wasOffline = !player.online;
+      player.online = true;
+      push(token, { type: 'hello', online: onlineCount(), serverTime: Date.now() });
+      if (wasOffline) for (const f of player.friends) push(f, { type: 'presence', token, online: true });
       const beat = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
       req.on('close', () => {
         clearInterval(beat);
         const set = streams.get(token);
-        if (set) { set.delete(res); if (!set.size) streams.delete(token); }
+        if (set) { set.delete(res); if (!set.size) { streams.delete(token); player.online = false; for (const f of player.friends) push(f, { type: 'presence', token, online: false }); } }
       });
       return;
     }
 
-    if (req.method === 'POST' && p === '/api/join') {
+    /* ---------- session ---------- */
+    if (POST && p === '/api/join') {
       const body = await readBody(req);
       let player = auth(req, body);
       if (!player) {
-        // A token that no longer exists (e.g. server restarted) with no nickname to create one.
         if (body.token && !String(body.nick || '').trim()) return json(res, 200, { stale: true });
-        player = makePlayer(body.nick);
-        postChat('lobby', player, `${player.nick} just joined qeep`, true);
-      } else if (body.nick) {
-        player.nick = String(body.nick).slice(0, 14).replace(/[^\w \-]/g, '') || player.nick;
+        player = world.makePlayer(body.nick);
+        world.postChat('lobby', player, `${player.nick} just joined qeep`, true);
+        persist();
       }
+      return json(res, 200, { player: world.publicProfile(player), rooms: Object.values(world.rooms).map((r) => ({ id: r.id, name: r.name, topic: r.topic })), online: onlineCount(), unreadDm: world.unreadCount(player.token) });
+    }
+
+    if (POST && p === '/api/state') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
       return json(res, 200, {
-        player: publicProfile(player),
-        rooms: Object.values(rooms).map((r) => ({ id: r.id, name: r.name })),
+        player: world.publicProfile(player),
+        rooms: Object.values(world.rooms).map((r) => ({ id: r.id, name: r.name, topic: r.topic, last: r.messages.at(-1) || null })),
+        threads: world.dmThreads(player.token),
+        unreadDm: world.unreadCount(player.token),
         online: onlineCount(),
       });
     }
 
-    if (req.method === 'POST' && p === '/api/history') {
+    /* ---------- chat ---------- */
+    if (POST && p === '/api/history') {
       const body = await readBody(req);
       const player = auth(req, body);
       if (!player) return json(res, 401, { error: 'no session' });
-      const room = rooms[body.room] || rooms.lobby;
+      const room = world.rooms[body.room] || world.rooms.lobby;
       return json(res, 200, { room: room.id, messages: room.messages });
     }
 
-    if (req.method === 'POST' && p === '/api/chat') {
+    if (POST && p === '/api/chat') {
       const body = await readBody(req);
       const player = auth(req, body);
       if (!player) return json(res, 401, { error: 'no session' });
-      if (!String(body.text || '').trim()) return json(res, 200, { ok: true });
-      postChat(body.room, player, body.text);
+      const text = String(body.text || '').trim();
+      if (!text) return json(res, 200, { ok: true });
+      if (rateLimited(player.token)) return json(res, 429, { error: 'Slow down a little!' });
+      if (text.startsWith('/') && handleCommand(player, body.room, text)) return json(res, 200, { ok: true });
+      const msg = world.postChat(body.room, player, decorate(text), false);
+      persist();
+      return json(res, 200, { ok: true, msg });
+    }
+
+    /* ---------- direct messages ---------- */
+    if (POST && p === '/api/dm/history') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const other = world.get(body.with);
+      if (!other) return json(res, 404, { error: 'No such player' });
+      world.markDMRead(player.token, other.token);
+      persist();
+      return json(res, 200, { with: { token: other.token, nick: other.nick, avatar: other.avatar, level: other.level, online: other.online }, messages: world.dmHistory(player.token, other.token) });
+    }
+
+    if (POST && p === '/api/dm') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const text = String(body.text || '').trim();
+      if (!text) return json(res, 200, { ok: true });
+      if (rateLimited(player.token)) return json(res, 429, { error: 'Slow down a little!' });
+      const r = world.sendDM(player, body.to, decorate(text));
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, r);
+    }
+
+    /* ---------- profile / economy ---------- */
+    if (POST && p === '/api/profile') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const r = world.updateProfile(player, body.patch || {});
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, { ok: true, profile: world.publicProfile(player) });
+    }
+
+    if (POST && p === '/api/shop/buy') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const r = world.buy(player, body.item);
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, { ok: true, profile: world.publicProfile(player) });
+    }
+
+    if (POST && p === '/api/daily') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const r = world.claimDaily(player);
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, { ...r, profile: world.publicProfile(player) });
+    }
+
+    /* ---------- friends ---------- */
+    if (POST && p === '/api/friend/request') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const target = (body.target ? world.get(body.target) : null) || world.findByNick(body.nick);
+      const r = world.friendRequest(player, target);
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, { ok: true, profile: world.publicProfile(player) });
+    }
+
+    if (POST && p === '/api/friend/accept') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const target = world.get(body.target);
+      if (!target) return json(res, 404, { error: 'No such player' });
+      const r = world.friendAccept(player, target);
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, { ok: true, profile: world.publicProfile(player) });
+    }
+
+    if (POST && p === '/api/friend/remove') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      world.friendRemove(player, body.target);
+      persist();
+      return json(res, 200, { ok: true, profile: world.publicProfile(player) });
+    }
+
+    if (POST && p === '/api/gift') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const target = world.get(body.to) || world.findByNick(body.nick);
+      if (!target) return json(res, 404, { error: 'No such player' });
+      const r = world.gift(player, target.token, body.amount);
+      if (r.error) return json(res, 400, r);
+      persist();
+      return json(res, 200, { ok: true, profile: world.publicProfile(player) });
+    }
+
+    if (POST && p === '/api/players/find') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const target = world.findByNick(body.nick);
+      if (!target) return json(res, 404, { error: 'No player called "' + String(body.nick || '').slice(0, 16) + '"' });
+      return json(res, 200, { player: { token: target.token, nick: target.nick, avatar: target.avatar, level: target.level, online: target.online, bio: target.bio } });
+    }
+
+    /* ---------- games ---------- */
+    if (POST && p === '/api/queue') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      const game = games.isValidGame(body.game) ? body.game : 'tictactoe';
+      const m = enqueue(game, player);
+      return json(res, 200, { queued: !m, match: m ? games.matchView(m) : null });
+    }
+
+    if (POST && p === '/api/cancel') {
+      const body = await readBody(req);
+      const player = auth(req, body);
+      if (!player) return json(res, 401, { error: 'no session' });
+      cancelQueue(games.isValidGame(body.game) ? body.game : 'tictactoe', player.token);
       return json(res, 200, { ok: true });
     }
 
-    if (req.method === 'POST' && p === '/api/queue') {
+    if (POST && p === '/api/move') {
       const body = await readBody(req);
       const player = auth(req, body);
       if (!player) return json(res, 401, { error: 'no session' });
-      const game = body.game === 'connect4' ? 'connect4' : 'tictactoe';
-      const match = enqueue(game, player);
-      return json(res, 200, { queued: !match, match: match ? matchView(match) : null });
+      const m = matchById(body.matchId);
+      if (!m) return json(res, 404, { error: 'No such match' });
+      const si = m.seats.findIndex((s) => !s.bot && s.token === player.token);
+      if (si === -1) return json(res, 403, { error: 'Not a player here' });
+      const wasPlaying = m.status === 'playing';
+      const r = games.applyMove(m, si, body.move);
+      if (r.error) return json(res, 400, { error: r.error });
+      afterChange(m, wasPlaying);
+      return json(res, 200, { ok: true, match: games.matchView(m) });
     }
 
-    if (req.method === 'POST' && p === '/api/cancel') {
+    if (POST && p === '/api/resign') {
       const body = await readBody(req);
       const player = auth(req, body);
       if (!player) return json(res, 401, { error: 'no session' });
-      cancelQueue(body.game === 'connect4' ? 'connect4' : 'tictactoe', player.token);
-      return json(res, 200, { ok: true });
-    }
-
-    if (req.method === 'POST' && p === '/api/move') {
-      const body = await readBody(req);
-      const player = auth(req, body);
-      if (!player) return json(res, 401, { error: 'no session' });
-      const m = matches.get(body.matchId);
-      if (!m) return json(res, 404, { error: 'no such match' });
-      const seatIndex = m.seats.findIndex((s) => !s.bot && s.token === player.token);
-      if (seatIndex === -1) return json(res, 403, { error: 'not a player' });
-      const result = applyMove(m, seatIndex, body.move);
-      if (result.error) return json(res, 400, { error: result.error });
-      pushMatch(m);
-      scheduleBotIfNeeded(m);
-      return json(res, 200, { ok: true, match: matchView(m) });
-    }
-
-    if (req.method === 'POST' && p === '/api/resign') {
-      const body = await readBody(req);
-      const player = auth(req, body);
-      const m = matches.get(body.matchId);
-      if (!player || !m) return json(res, 404, { error: 'no match' });
-      const seatIndex = m.seats.findIndex((s) => !s.bot && s.token === player.token);
-      if (seatIndex === -1) return json(res, 403, { error: 'not a player' });
-      const foe = m.seats[1 - seatIndex];
-      finish(m, foe.mark, null);
-      pushMatch(m);
+      const m = matchById(body.matchId);
+      if (!m) return json(res, 404, { error: 'No such match' });
+      const si = m.seats.findIndex((s) => !s.bot && s.token === player.token);
+      if (si === -1) return json(res, 403, { error: 'Not a player here' });
+      if (m.status === 'playing') {
+        m.status = 'finished';
+        m.winner = m.seats[1 - si].mark;
+        const wasPlaying = true;
+        afterChange(m, wasPlaying);
+      }
       return json(res, 200, { ok: true });
     }
 
@@ -519,11 +445,31 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('');
-  console.log('  ============================================');
-  console.log('   qeep revival is online');
-  console.log(`   open your browser at:  http://localhost:${PORT}`);
-  console.log('  ============================================');
-  console.log('');
-});
+/* ------------------------------- boot ------------------------------- */
+
+(async () => {
+  await store.init();
+  const data = await store.load();
+  if (world.hydrate(data)) console.log('[store] loaded saved world');
+  for (const game of ['tictactoe', 'connect4', 'reversi', 'nim', 'rps', 'quiz']) queues[game] = [];
+  // prune finished matches occasionally
+  setInterval(() => { const cut = Date.now() - 1000 * 60 * 30; for (const [id, m] of matches) if (m.status === 'finished' && m.createdAt < cut) matches.delete(id); }, 60000).unref?.();
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log('');
+    console.log('  ============================================');
+    console.log('   qeep revival v2 is online');
+    console.log(`   http://localhost:${PORT}`);
+    console.log(`   storage: ${store.info().mode}`);
+    console.log('  ============================================');
+    console.log('');
+  });
+})();
+
+async function shutdown() {
+  console.log('\n[qeep] saving and shutting down...');
+  try { await store.flushNow(() => world.snapshot()); } catch (_) {}
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

@@ -1,14 +1,19 @@
 {
   "name": "qeep-revival",
-  "version": "1.0.0",
-  "description": "A loving revival of qeep - the classic J2ME mobile social network: retro phone UI, live chat, turn-based multiplayer games, and coins.",
+  "version": "2.0.0",
+  "description": "A loving revival of qeep - the classic J2ME mobile social network. Retro phone UI, live chat, friends, private messages, six turn-based multiplayer games, coins, XP, badges and a shop.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "smoke": "node scripts/smoke.js",
+    "test": "node scripts/smoke.js"
   },
   "engines": {
     "node": "20.x"
   },
-  "keywords": ["qeep", "j2me", "retro", "chat", "multiplayer", "nokia", "games"],
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "keywords": ["qeep", "j2me", "retro", "chat", "multiplayer", "nokia", "games", "social"],
   "license": "MIT"
 }
