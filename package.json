@@ -7,7 +7,7 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "20.x"
   },
   "keywords": ["qeep", "j2me", "retro", "chat", "multiplayer", "nokia", "games"],
   "license": "MIT"
